@@ -5,7 +5,7 @@ from django.contrib.auth.models import User
 from django.http import HttpResponse
 import pandas as pd
 from io import BytesIO
-from django.db.models import Sum, Count, F
+from django.db.models import Sum, Count, F, Q
 from django.utils import timezone
 from datetime import timedelta
 # --- O'zgartirilgan importlar ---
@@ -16,13 +16,13 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework import viewsets
 # --------------------------------
 from django.contrib.auth.models import Group
-from .permissions import IsAdminUser
-from .serializers import UserListSerializer, UserCreateSerializer, GroupSerializer
+from .permissions import IsAdminUser, IsProductManager
+from .serializers import UserListSerializer, UserCreateSerializer, GroupSerializer, UserSerializer
 from .serializers import SaleStatusUpdateSerializer # <-- Importlarga qo'shing
-from .models import Product, Customer, Sale, SaleItem, Payment, GoodsReceipt
-from .filters import SaleFilter
+from .models import Product, Customer, Sale, SaleItem, Payment, GoodsReceipt, ReturnedProduct
+from .filters import SaleFilter, ReturnedProductFilter
 from .serializers import UserUpdateSerializer
-from .permissions import IsAdminUser, IsSotuvchi, IsOmborchi, IsBuxgalter
+from .permissions import IsSotuvchi, IsOmborchi, IsBuxgalter
 from rest_framework.permissions import IsAuthenticated # Bu ham kerak bo'ladi
 from .serializers import (
     ProductSerializer,
@@ -30,14 +30,70 @@ from .serializers import (
     SaleSerializer,
     PaymentSerializer,
     GoodsReceiptSerializer,
-    SalesListSerializer
+    SalesListSerializer,
+    ReturnedProductSerializer
 )
 
 # --- MAHSULOTLAR, MIJOZLAR, NARXLAR RO‘YXATI --- #
-class ProductListAPIView(generics.ListAPIView):
+class ProductListAPIView(generics.ListCreateAPIView):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    permission_classes = [IsAuthenticated] # Tizimga kirgan hamma ko'ra olsin
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated()]
+        return [IsProductManager()]
+
+
+class ProductDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Product.objects.all()
+    serializer_class = ProductSerializer
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAuthenticated()]
+        return [IsProductManager()]
+
+
+class ProductTransferAPIView(APIView):
+    permission_classes = [IsProductManager]
+
+    def post(self, request, pk):
+        try:
+            product = Product.objects.get(pk=pk)
+        except Product.DoesNotExist:
+            return Response({'error': 'Mahsulot topilmadi'}, status=status.HTTP_404_NOT_FOUND)
+
+        from_condition = request.data.get('from_condition')
+        to_condition = request.data.get('to_condition')
+        quantity = request.data.get('quantity')
+
+        valid_conditions = {ReturnedProduct.CONDITION_HEALTHY, ReturnedProduct.CONDITION_DEFECTIVE}
+        if from_condition not in valid_conditions or to_condition not in valid_conditions or from_condition == to_condition:
+            return Response({'error': "Holatlar noto'g'ri tanlangan."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return Response({'error': "Miqdor butun son bo'lishi kerak."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if quantity <= 0:
+            return Response({'error': "Miqdor 0 dan katta bo'lishi kerak."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from_field = 'quantity_healthy' if from_condition == ReturnedProduct.CONDITION_HEALTHY else 'quantity_defective'
+        to_field = 'quantity_defective' if to_condition == ReturnedProduct.CONDITION_DEFECTIVE else 'quantity_healthy'
+
+        with transaction.atomic():
+            current_from = getattr(product, from_field, 0) or 0
+            if current_from < quantity:
+                return Response({'error': "Ko'chirish uchun yetarli qoldiq mavjud emas."}, status=status.HTTP_400_BAD_REQUEST)
+
+            setattr(product, from_field, current_from - quantity)
+            current_to = getattr(product, to_field, 0) or 0
+            setattr(product, to_field, current_to + quantity)
+            product.save(update_fields=[from_field, to_field])
+
+        return Response(ProductSerializer(product).data, status=status.HTTP_200_OK)
 
 
 class CustomerListAPIView(generics.ListAPIView):
@@ -339,8 +395,21 @@ class SaleDetailAPIView(generics.RetrieveAPIView):
 # views.py fayli ichida FAQAT SHU KLASSNI ALMASHTIRING
 
 class SaleStatusUpdateAPIView(APIView):  # <-- generics.UpdateAPIView'dan APIView'ga o'zgartirdik
-    permission_classes = [IsAdminUser | IsSotuvchi]
+    permission_classes = [IsAuthenticated]
     """ Bitta sotuvning faqat statusini o'zgartiradi (qo'lda yozilgan mantiq) """
+
+    SELLER_ALLOWED_STATUSES = {
+        'yaratildi',
+        'omborga_yuborildi',
+        'bron_qilindi',
+        'bron_bekor_qilindi',
+        'buyurtma_bekor_qilindi',
+    }
+    WAREHOUSE_ALLOWED_STATUSES = {
+        'yigildi',
+        'yuborildi',
+        'bron_yuborildi',
+    }
 
     def patch(self, request, pk, *args, **kwargs):
         # 1. URL'dan kelgan 'pk' bo'yicha sotuvni topishga harakat qilamiz
@@ -349,21 +418,136 @@ class SaleStatusUpdateAPIView(APIView):  # <-- generics.UpdateAPIView'dan APIVie
         except Sale.DoesNotExist:
             return Response({"error": "Sotuv topilmadi"}, status=status.HTTP_404_NOT_FOUND)
 
+        previous_status = sale_instance.status
+
         # 2. Serializer orqali kelgan ma'lumotni tekshiramiz
-        # 'partial=True' - bu PATCH uchun kerak, faqat o‘zgargan maydonlarni olish imkonini beradi
+        # 'partial=True' - bu PATCH uchun kerak, faqat o'zgargan maydonlarni olish imkonini beradi
         serializer = SaleStatusUpdateSerializer(instance=sale_instance, data=request.data, partial=True)
 
-        if serializer.is_valid():
-            # 3. Ma'lumot to‘g‘ri bo‘lsa, saqlaymiz
-            serializer.save()
-            # 4. Muvaffaqiyatli javobni qaytaramiz
-            return Response(serializer.data, status=status.HTTP_200_OK)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # 5. Agar ma'lumot xato bo‘lsa, validatsiya xatolarini qaytaramiz
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        requested_status = serializer.validated_data.get('status', previous_status)
+        user = request.user
+
+        if not self._is_status_change_allowed(user, requested_status):
+            return Response(
+                {"error": "Sizda bu statusga o'zgartirish uchun ruxsat yo'q."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer.save()
+
+        if self._is_seller(user) and requested_status != previous_status:
+            self._notify_warehouse_about_status_change(sale_instance, user, requested_status)
+
+        # 4. Muvaffaqiyatli javobni qaytaramiz
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def _is_seller(self, user):
+        return user.groups.filter(name='Sotuvchilar').exists()
+
+    def _is_warehouse(self, user):
+        return user.groups.filter(name='Omborchilar').exists()
+
+    def _is_status_change_allowed(self, user, status_value):
+        if user.is_staff:
+            return True  # Administrator barcha statuslarni o'zgartira oladi.
+
+        if self._is_seller(user):
+            return status_value in self.SELLER_ALLOWED_STATUSES
+
+        if self._is_warehouse(user):
+            return status_value in self.WAREHOUSE_ALLOWED_STATUSES
+
+        return False
+
+    def _notify_warehouse_about_status_change(self, sale, actor, new_status):
+        """
+        Sotuvchi statusni o'zgartirganda Omborchilar guruhiga xabar yuboramiz.
+        Xabar e-mail orqali jo'natiladi; agar email topilmasa, server logiga yozib qo'yamiz.
+        """
+        from django.core.mail import send_mail
+
+        warehouse_group = Group.objects.filter(name='Omborchilar').first()
+        if not warehouse_group:
+            print(f"[NOTIFICATION] Omborchilar guruhi topilmadi. Sotuv #{sale.id} statusi {new_status} ga o'zgartirildi.")
+            return
+
+        recipient_emails = list(warehouse_group.user_set.exclude(email='').values_list('email', flat=True))
+        subject = f"Sotuv #{sale.id} status o'zgarishi"
+        message = (
+            "Salom!\n\n"
+            f"Sotuvchi {actor.get_full_name() or actor.username} sotuv #{sale.id} (mijoz: {sale.customer.full_name}) "
+            f"statusini \"{sale.get_status_display()}\" ga o'zgartirdi.\n"
+            "Iltimos, buyurtmani ko'rib chiqing.\n\nRahmat."
+        )
+
+        if recipient_emails:
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=None,
+                recipient_list=recipient_emails,
+                fail_silently=True,
+            )
+        else:
+            print(f"[NOTIFICATION] Omborchilar uchun email topilmadi. {message}")
 
 
 # views.py fayli ichida FAQAT SHU KLASSNI ALMASHTIRING
+
+
+class ReturnedProductViewSet(viewsets.ModelViewSet):
+    queryset = ReturnedProduct.objects.select_related('customer', 'product', 'recorded_by').order_by('-returned_at', '-id')
+    serializer_class = ReturnedProductSerializer
+    permission_classes = [IsAdminUser | IsOmborchi | IsSotuvchi | IsBuxgalter]
+    filterset_class = ReturnedProductFilter
+
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            instance = serializer.save(
+                recorded_by=self.request.user if self.request.user.is_authenticated else None
+            )
+            self._apply_stock(instance.product, instance.quantity, instance.condition, add=True)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        old_product = instance.product
+        old_quantity = instance.quantity
+        old_condition = instance.condition
+
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            self.perform_update(serializer)
+            updated_instance = serializer.instance
+            self._apply_stock(old_product, old_quantity, old_condition, add=False)
+            self._apply_stock(updated_instance.product, updated_instance.quantity, updated_instance.condition, add=True)
+
+        return Response(serializer.data)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        with transaction.atomic():
+            self._apply_stock(instance.product, instance.quantity, instance.condition, add=False)
+            self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _apply_stock(self, product, quantity, condition, add=True):
+        field_name = 'quantity_healthy' if condition == ReturnedProduct.CONDITION_HEALTHY else 'quantity_defective'
+        current_value = getattr(product, field_name, 0) or 0
+        quantity = int(quantity)
+        if add:
+            new_value = current_value + quantity
+        else:
+            new_value = current_value - quantity
+            if new_value < 0:
+                new_value = 0
+        setattr(product, field_name, new_value)
+        product.save(update_fields=[field_name])
 
 class DashboardStatsAPIView(APIView):
     def get(self, request, *args, **kwargs):
@@ -404,6 +588,20 @@ class DashboardStatsAPIView(APIView):
         total_customers_count = Customer.objects.count()
         total_products_count = Product.objects.count()
 
+        today = timezone.localdate()
+
+        returns_aggregates = ReturnedProduct.objects.aggregate(
+            total_quantity=Sum('quantity'),
+            healthy_quantity=Sum('quantity', filter=Q(condition=ReturnedProduct.CONDITION_HEALTHY)),
+            defective_quantity=Sum('quantity', filter=Q(condition=ReturnedProduct.CONDITION_DEFECTIVE)),
+            today_quantity=Sum('quantity', filter=Q(returned_at=today))
+        )
+
+        total_returns_quantity = returns_aggregates['total_quantity'] or 0
+        healthy_returns_quantity = returns_aggregates['healthy_quantity'] or 0
+        defective_returns_quantity = returns_aggregates['defective_quantity'] or 0
+        today_returns_quantity = returns_aggregates['today_quantity'] or 0
+
         # 6. Grafiklar uchun ma'lumotlarni ham filtrlangan queryset asosida hisoblaymiz
         sales_by_seller = User.objects.filter(sale__in=sales_queryset).annotate(
             total_amount=Sum(F('sale__items__quantity') * F('sale__items__price')),
@@ -423,6 +621,10 @@ class DashboardStatsAPIView(APIView):
                 'total_customer_debt': total_customer_debt, # Bu global bo'lib qoladi
                 'total_customers_count': total_customers_count, # Bu global
                 'total_products_count': total_products_count, # Bu global
+                'total_returns_quantity': total_returns_quantity,
+                'healthy_returns_quantity': healthy_returns_quantity,
+                'defective_returns_quantity': defective_returns_quantity,
+                'today_returns_quantity': today_returns_quantity,
             },
             'sales_by_seller': list(sales_by_seller),
             'top_products': list(top_products),
@@ -503,18 +705,11 @@ class CustomerReconciliationAPIView(APIView):
     
 
 class CurrentUserAPIView(APIView):
+    permission_classes = [IsAuthenticated]  # Faqat tizimga kirgan foydalanuvchilar o'z ma'lumotini olishlari mumkin.
+
     def get(self, request):
-        user = request.user
-        if not user or not getattr(user, "is_authenticated", False):
-            return Response({"error": "Authentication required."}, status=status.HTTP_401_UNAUTHORIZED)
-        data = {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-        }
-        return Response(data)
+        serializer = UserSerializer(request.user)  # Serializer guruhlar va is_staff maydonlarini ham qaytaradi.
+        return Response(serializer.data)
     
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all().order_by('id') # <-- Tartiblab olamiz

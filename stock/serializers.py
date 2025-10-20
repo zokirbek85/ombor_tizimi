@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User, Group
 from .models import (
-    Product, Customer, Sale, SaleItem, Payment, GoodsReceipt
+    Product, Customer, Sale, SaleItem, Payment, GoodsReceipt, ReturnedProduct
 )
 
 # --- ASOSIY MODELLAR UCHUN ---
@@ -135,3 +135,38 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
     class Meta:
         model = GoodsReceipt
         fields = ('id', 'product', 'quantity', 'created_at')
+
+
+class ReturnedProductSerializer(serializers.ModelSerializer):
+    customer_detail = CustomerSerializer(source='customer', read_only=True)
+    product_detail = ProductSerializer(source='product', read_only=True)
+    recorded_by_detail = UserSerializer(source='recorded_by', read_only=True)
+
+    class Meta:
+        model = ReturnedProduct
+        fields = (
+            'id',
+            'customer',
+            'product',
+            'quantity',
+            'condition',
+            'reason',
+            'returned_at',
+            'recorded_by',
+            'created_at',
+            'customer_detail',
+            'product_detail',
+            'recorded_by_detail',
+        )
+        read_only_fields = (
+            'recorded_by',
+            'created_at',
+            'customer_detail',
+            'product_detail',
+            'recorded_by_detail',
+        )
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Miqdor musbat bo'lishi kerak.")
+        return value

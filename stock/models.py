@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User  # <-- SHU QATOR QO'SHILDI
+from django.utils import timezone
 
 # Ma'lumotlar bazasi jadvallarining "chizmalari" (modellar) shu yerda yaratiladi.
 
@@ -123,3 +124,40 @@ class GoodsReceipt(models.Model):
     class Meta:
         verbose_name = "Yuk kirimi"
         verbose_name_plural = "Yuk kirimlari"
+
+
+class ReturnedProduct(models.Model):
+    """
+    Mijozlardan qaytgan mahsulotlarni ro'yxatga oladi.
+    """
+
+    CONDITION_HEALTHY = 'healthy'
+    CONDITION_DEFECTIVE = 'defective'
+    CONDITION_CHOICES = [
+        (CONDITION_HEALTHY, "Sog'lom"),
+        (CONDITION_DEFECTIVE, "Brak"),
+    ]
+
+    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, verbose_name="Mijoz")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="Mahsulot")
+    quantity = models.PositiveIntegerField(verbose_name="Soni")
+    condition = models.CharField(max_length=16, choices=CONDITION_CHOICES, verbose_name="Mahsulot holati")
+    reason = models.TextField(blank=True, verbose_name="Qaytarish sababi")
+    returned_at = models.DateField(default=timezone.now, verbose_name="Qaytarilgan sana")
+    recorded_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recorded_returns",
+        verbose_name="Qayd etgan foydalanuvchi",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Yozuv yaratilgan sana")
+
+    class Meta:
+        verbose_name = "Qaytarilgan mahsulot"
+        verbose_name_plural = "Qaytarilgan mahsulotlar"
+        ordering = ['-returned_at', '-id']
+
+    def __str__(self):
+        return f"{self.customer} -> {self.product} ({self.quantity})"

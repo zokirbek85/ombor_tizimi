@@ -1,8 +1,8 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
-    UserViewSet, GroupListView, CurrentUserAPIView,
-    ProductListAPIView, ProductExportAPIView, ProductImportAPIView, ProductPriceAPIView,
+    UserViewSet, GroupListView, CurrentUserAPIView, ReturnedProductViewSet,
+    ProductListAPIView, ProductDetailAPIView, ProductTransferAPIView, ProductExportAPIView, ProductImportAPIView, ProductPriceAPIView,
     CustomerListAPIView, CustomerExportAPIView, CustomerImportAPIView, CustomerReconciliationAPIView,
     SalesListAPIView, SaleDetailAPIView, SaleExportAPIView, SaleCreateAPIView, SaleStatusUpdateAPIView,
     PaymentCreateAPIView, GoodsReceiptCreateAPIView,
@@ -12,6 +12,7 @@ from .views import (
 # 1. "Kombayn"lar (ViewSet'lar) uchun router
 router = DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
+router.register(r'returns', ReturnedProductViewSet, basename='returnedproduct')
 
 # 2. "Kurak"lar (oddiy View'lar) uchun standart ro'yxat
 urlpatterns = [
@@ -26,9 +27,11 @@ urlpatterns = [
 
     # Mahsulotlar
     path('products/', ProductListAPIView.as_view(), name='product-list'),
+    path('products/<int:pk>/', ProductDetailAPIView.as_view(), name='product-detail'),
     path('products/export/', ProductExportAPIView.as_view(), name='product-export'),
     path('products/import/', ProductImportAPIView.as_view(), name='product-import'),
     path('products/<int:pk>/price/', ProductPriceAPIView.as_view(), name='product-price'),
+    path('products/<int:pk>/transfer/', ProductTransferAPIView.as_view(), name='product-transfer'),
 
     # Mijozlar
     path('customers/', CustomerListAPIView.as_view(), name='customer-list'),
